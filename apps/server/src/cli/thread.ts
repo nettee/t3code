@@ -1,4 +1,5 @@
 import {
+  OrchestrationV2DispatchCommandResult,
   OrchestratorMcpFailure,
   OrchestratorMcpThreadListResult,
   OrchestratorMcpThreadReadResult,
@@ -1058,12 +1059,44 @@ const threadShowCommand = Command.make("show", {
   ),
 );
 
+const makeThreadSettlementCommand = (action: "settle" | "unsettle", description: string) =>
+  Command.make(action, {
+    ...projectLocationFlags,
+    thread: threadArgument,
+    json: jsonFlag,
+  }).pipe(
+    Command.withDescription(description),
+    Command.withHandler((flags) =>
+      Effect.gen(function* () {
+        const threadId = yield* decodeThreadId(flags.thread);
+        yield* withThreadTools(
+          flags,
+          Effect.fn(`cli.thread.${action}`)(function* (tools) {
+            const result = yield* tools.call(
+              "t3_thread_organize",
+              { threadId, action },
+              OrchestrationV2DispatchCommandResult,
+            );
+            yield* flags.json
+              ? printJson({ threadId, ...result })
+              : Console.log(`${action === "settle" ? "Settled" : "Unsettled"} ${threadId}.`);
+          }),
+        );
+      }).pipe(reportThreadErrors),
+    ),
+  );
+
 export const threadCommand = Command.make("thread").pipe(
-  Command.withDescription("Start, message, and read threads on the running server."),
+  Command.withDescription("Start, message, read, and settle threads on the running server."),
   Command.withSubcommands([
     threadListCommand,
     threadStartCommand,
     threadSendCommand,
     threadShowCommand,
+    makeThreadSettlementCommand(
+      "settle",
+      "Settle a thread. Running threads, approvals, and queued user messages must be resolved first.",
+    ),
+    makeThreadSettlementCommand("unsettle", "Bring a settled thread back to the inbox."),
   ]),
 );

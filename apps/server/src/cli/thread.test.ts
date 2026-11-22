@@ -53,6 +53,173 @@ vi.mock("../auth/EnvironmentAuth.ts", async (importOriginal) => {
 const threadId = ThreadId.make("thread-1");
 const runId = RunId.make("run-1");
 
+const settlementTestLayer = Layer.mergeAll(
+  NodeServices.layer,
+  NodeCrypto.layer,
+  NetService.layer,
+  ConfigProvider.layer(ConfigProvider.fromEnv({ env: { T3CODE_PORT: "3773" } })),
+);
+
+const settlementBaseDir = Effect.fn("test.settlementBaseDir")(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-thread-settlement-" });
+  yield* persistServerRuntimeState({
+    path: path.join(baseDir, "userdata", "server-runtime.json"),
+    state: yield* makePersistedServerRuntimeState({
+      config: { host: "127.0.0.1", devUrl: undefined },
+      port: 3_773,
+    }),
+  });
+  return baseDir;
+});
+
+it.effect.each([
+  { action: "settle", json: true },
+  { action: "settle", json: false },
+  { action: "unsettle", json: true },
+  { action: "unsettle", json: false },
+])("$action prints a committed result (json: $json)", ({ action, json }) =>
+  Effect.gen(function* () {
+    const baseDir = yield* settlementBaseDir();
+    using session = vi.spyOn(McpBridge, "mcpToolSession").mockReturnValue(
+      Effect.succeed({
+        call: (tool, args) => {
+          assert.equal(tool, "t3_thread_organize");
+          assert.deepStrictEqual(args, { threadId, action });
+          return Effect.succeed({ structuredContent: { sequence: 42 } });
+        },
+      }),
+    );
+    yield* Command.runWith(threadCommand, { version: "0.0.0" })([
+      action,
+      ` ${threadId} `,
+      "--base-dir",
+      baseDir,
+      ...(json ? ["--json"] : []),
+    ]);
+    assert.equal(session.mock.calls[0]?.[0].endpoint, "http://127.0.0.1:3773/mcp");
+    const lines = yield* TestConsole.logLines;
+    assert.deepStrictEqual(lines, [
+      json
+        ? JSON.stringify({ threadId, sequence: 42 })
+        : `${action === "settle" ? "Settled" : "Unsettled"} ${threadId}.`,
+    ]);
+  }).pipe(Effect.scoped, Effect.provide(settlementTestLayer)),
+);
+
+it.effect.each([
+  {
+    name: "missing thread",
+    result: {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            _tag: "OrchestratorMcpFailure",
+            code: "thread_not_found",
+            message: "Thread missing was not found.",
+          }),
+        },
+      ],
+    },
+    tag: "ThreadToolFailedError",
+    message: "Thread missing was not found.",
+  },
+  {
+    name: "permission refusal",
+    result: {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            _tag: "OrchestratorMcpFailure",
+            code: "capability_denied",
+            message: "This client has read-only access.",
+          }),
+        },
+      ],
+    },
+    tag: "ThreadToolFailedError",
+    message: "This client has read-only access.",
+  },
+  {
+    name: "running thread",
+    result: {
+      isError: true,
+      content: [
+        { type: "text", text: "Thread thread-1 is still running. Stop it before settling." },
+      ],
+    },
+    tag: "ThreadToolFailedError",
+    message: "Thread thread-1 is still running. Stop it before settling.",
+  },
+  {
+    name: "malformed commit result",
+    result: { structuredContent: { sequence: -1 } },
+    tag: "ThreadToolFailedError",
+    message:
+      "The server sent an unexpected t3_thread_organize result. Update the t3 CLI to match the server.",
+  },
+  {
+    name: "deferred self-settlement result",
+    result: { structuredContent: { settlesWhenTurnEnds: true } },
+    tag: "ThreadToolFailedError",
+    message:
+      "The server sent an unexpected t3_thread_organize result. Update the t3 CLI to match the server.",
+  },
+  {
+    name: "lost connection",
+    result: null,
+    tag: "ThreadServerUnreachableError",
+    message: "Could not reach the T3 Code server at http://127.0.0.1:3773. connection closed",
+  },
+])("settlement propagates $name without printing success", ({ result, tag, message }) =>
+  Effect.gen(function* () {
+    const baseDir = yield* settlementBaseDir();
+    using _session = vi.spyOn(McpBridge, "mcpToolSession").mockReturnValue(
+      Effect.succeed({
+        call: () =>
+          result === null
+            ? Effect.fail(new McpBridge.AcpMcpBridgeError({ message: "connection closed" }))
+            : Effect.succeed(result),
+      }),
+    );
+    for (const action of ["settle", "unsettle"]) {
+      const error = yield* Command.runWith(threadCommand, { version: "0.0.0" })([
+        action,
+        threadId,
+        "--base-dir",
+        baseDir,
+        "--json",
+      ]).pipe(Effect.flip);
+      assert.equal(error._tag, tag);
+      assert.equal(error.message, message);
+    }
+    assert.deepStrictEqual(yield* TestConsole.logLines, []);
+  }).pipe(Effect.scoped, Effect.provide(settlementTestLayer)),
+);
+
+it.effect("settlement rejects an empty id before connecting", () =>
+  Effect.gen(function* () {
+    using session = vi
+      .spyOn(McpBridge, "mcpToolSession")
+      .mockReturnValue(Effect.die("must not connect"));
+    for (const action of ["settle", "unsettle"]) {
+      const error = yield* Command.runWith(threadCommand, { version: "0.0.0" })([
+        action,
+        "   ",
+        "--json",
+      ]).pipe(Effect.flip);
+      assert.equal(error._tag, "ThreadUsageError");
+    }
+    assert.equal(session.mock.calls.length, 0);
+    assert.deepStrictEqual(yield* TestConsole.logLines, []);
+  }).pipe(Effect.provide(settlementTestLayer)),
+);
+
 it.effect("list includes delegated threads across pages and still leaves out subagents", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -238,43 +405,46 @@ it.effect(
     ),
 );
 
-it.effect("does not sign in to whatever took over a dead server's port", () =>
-  Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
-    const path = yield* Path.Path;
-    const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-thread-dead-server-" });
-    const state = yield* makePersistedServerRuntimeState({
-      config: { host: "127.0.0.1", devUrl: undefined },
-      port: 3_773,
-    });
-    yield* persistServerRuntimeState({
-      path: path.join(baseDir, "userdata", "server-runtime.json"),
-      // Above Linux's PID ceiling, as in pair.test.ts: no process can hold it.
-      state: { ...state, pid: 4_194_305 },
-    });
-    using session = vi
-      .spyOn(McpBridge, "mcpToolSession")
-      .mockReturnValue(Effect.die("no session should open"));
+it.effect.each(["list", "settle", "unsettle"])(
+  "$0 does not sign in to whatever took over a dead server's port",
+  (action) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-thread-dead-server-" });
+      const state = yield* makePersistedServerRuntimeState({
+        config: { host: "127.0.0.1", devUrl: undefined },
+        port: 3_773,
+      });
+      yield* persistServerRuntimeState({
+        path: path.join(baseDir, "userdata", "server-runtime.json"),
+        // Above Linux's PID ceiling, as in pair.test.ts: no process can hold it.
+        state: { ...state, pid: 4_194_305 },
+      });
+      using session = vi
+        .spyOn(McpBridge, "mcpToolSession")
+        .mockReturnValue(Effect.die("no session should open"));
 
-    const error = yield* Command.runWith(threadCommand, { version: "0.0.0" })([
-      "list",
-      "--base-dir",
-      baseDir,
-    ]).pipe(Effect.flip);
+      const error = yield* Command.runWith(threadCommand, { version: "0.0.0" })([
+        action,
+        ...(action === "list" ? [] : [threadId]),
+        "--base-dir",
+        baseDir,
+      ]).pipe(Effect.flip);
 
-    assert.strictEqual(error._tag, "ThreadServerNotRunningError");
-    assert.strictEqual(session.mock.calls.length, 0);
-  }).pipe(
-    Effect.scoped,
-    Effect.provide(
-      Layer.mergeAll(
-        NodeServices.layer,
-        NodeCrypto.layer,
-        NetService.layer,
-        ConfigProvider.layer(ConfigProvider.fromEnv({ env: { T3CODE_PORT: "3773" } })),
+      assert.strictEqual(error._tag, "ThreadServerNotRunningError");
+      assert.strictEqual(session.mock.calls.length, 0);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          NetService.layer,
+          ConfigProvider.layer(ConfigProvider.fromEnv({ env: { T3CODE_PORT: "3773" } })),
+        ),
       ),
     ),
-  ),
 );
 
 /** Answers each tool call with the next scripted response for that tool. */

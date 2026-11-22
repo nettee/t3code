@@ -144,6 +144,8 @@ without a sign-in:
 id=$(t3 thread start . "Find why the tests are slow")
 t3 thread send "$id" "Now fix it" --wait
 t3 thread show "$id"
+t3 thread settle "$id" --json
+t3 thread unsettle "$id"
 t3 thread list
 ```
 
@@ -163,6 +165,18 @@ options.
 `--wait` prints the agent's reply. It exits 1 when the run fails or stops, and
 2 when the agent waits for an answer you give in the app. Add `--json` for a
 result that always includes the thread id.
+
+After reviewing the result, use `settle` to remove the thread from the inbox;
+`unsettle` brings it back. Repeating either command succeeds. Settling requires
+the thread to have no running turn, pending approval or blocking question, or
+queued user message. Resolve those first; `settle` does not stop or wait for a
+turn. Archived threads must be unarchived in the app first.
+
+Both commands accept `--json`, which prints `{ "threadId": "…", "sequence": 42 }`
+after the change commits. Check `settled` with `show --json` or `list --json`.
+Invalid or missing threads, connection failures, and permission refusals exit
+non-zero without a success result. Pass `--base-dir <directory>` to select a
+different running environment's T3 home, as with the other thread commands.
 
 ## Remove an agent
 
